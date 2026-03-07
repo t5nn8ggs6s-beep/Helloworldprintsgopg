@@ -4,7 +4,7 @@ import random
 import string
 import sqlite3
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types, 
+from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.dispatcher import FSMContext
